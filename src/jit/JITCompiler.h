@@ -12,7 +12,7 @@
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
-#include <llvm/ExecutionEngine/Orc/ThreadSafeContext.h>
+#include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <memory>
 #include <string>
 

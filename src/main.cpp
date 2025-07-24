@@ -1,6 +1,7 @@
 #include <iostream>
 #include "jit/JITCompiler.h"
 #include "utils/MatrixUtils.h"
+#define SIZE 128
 
 int main() {
     const int rows = SIZE;    // Set the number of rows
@@ -24,15 +25,16 @@ int main() {
 
     // Create JIT compiler instance
     JITCompiler jitCompiler;
+    std::string kernelCode = R"(
+; LLVM IR code for matrix multiplication kernel goes here
+)";
 
-    // Compile the matrix multiplication kernel
-    jitCompiler.compileMatMulKernel();
-
-    // Execute the matrix multiplication
-    jitCompiler.executeMatMul(left, right, result, rows, columns, inners);
+    // Compile and Execute the matrix multiplication kernel
+    jitCompiler.initialize();
+    jitCompiler.compileAndExecute("", left, right, result, rows, columns, inners);
 
     // Print the result (optional)
-    // printMatrix(result, rows, columns);
+    printMatrix(result, rows, columns);
 
     // Free allocated memory
     std::free(left);

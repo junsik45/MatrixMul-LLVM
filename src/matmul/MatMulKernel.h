@@ -1,23 +1,21 @@
 // MatMulKernel.h
-#ifndef MATMULKERNEL_H
-#define MATMULKERNEL_H
+#pragma once
 
 #include <vector>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+#include <memory>
 
 class MatMulKernel {
 public:
-    MatMulKernel(int rows, int columns, int inners);
-    void initializeMatrices();
+    void initializeMatrices(int rows, int columns, int inners);
     void execute();
-    const std::vector<float>& getResult() const;
+    void printResult() const;
+    llvm::orc::ThreadSafeModule createModule();
+
 
 private:
-    int rows_;
-    int columns_;
-    int inners_;
-    std::vector<float> left_;
-    std::vector<float> right_;
-    std::vector<float> result_;
+    int rows = 0, columns = 0, inners = 0;
+    std::vector<float> left, right, result;
 };
-
-#endif // MATMULKERNEL_H
