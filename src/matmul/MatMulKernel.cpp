@@ -4,6 +4,45 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/FormattedStream.h>
+#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/Target/TargetOptions.h>
+#include <llvm/MC/TargetRegistry.h>
+#include <llvm/TargetParser/Triple.h>
+#include <llvm/TargetParser/Host.h>
+#include <llvm/IR/Module.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IRReader/IRReader.h>
+#include <llvm/Linker/Linker.h>
+#include <llvm/Support/Error.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/SourceMgr.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/IR/Intrinsics.h>
+#include <llvm/IR/MDBuilder.h>
+#include <llvm/Transforms/Utils/Cloning.h>
+
+
+    // ------------------------------
+    // Helper: declare NVVM sreg readers by name (works across LLVM versions)
+    // ------------------------------
+
+
+
+static llvm::FunctionCallee getNvvmSReg(llvm::Module &M, llvm::StringRef name) {
+    llvm::LLVMContext &C = M.getContext();
+    llvm::FunctionType *FT = llvm::FunctionType::get(
+        llvm::Type::getInt32Ty(C),     // Return type: i32
+        false                          // No parameters
+    );
+    return M.getOrInsertFunction(name, FT);
+}
+
+
+
 void MatMulKernel::initializeMatrices(int r, int c, int k) {
     rows = r;
     columns = c;
@@ -41,131 +80,164 @@ void MatMulKernel::printResult() const {
         std::cout << std::endl;
     }
 }
-llvm::orc::ThreadSafeModule MatMulKernel::createModule() {
-    auto context = std::make_unique<llvm::LLVMContext>();
-    auto& ctx = *context;  // Get a reference for easier use
-    auto module = std::make_unique<llvm::Module>("matmul_module", ctx);
+llvm::orc::ThreadSafeModule MatMulKernel::createModule(llvm::orc::ThreadSafeContext& TSCtx) {
+    using namespace llvm;
+    LLVMContext &ctx = *TSCtx.getContext();  // Same code as before
 
-    // Define function signature: void matmul(float*, float*, float*, int, int, int)
-    auto floatPtrTy = llvm::Type::getFloatTy(ctx)->getPointerTo();
-    auto intTy = llvm::Type::getInt32Ty(ctx);
-    std::vector<llvm::Type*> params = {floatPtrTy, floatPtrTy, floatPtrTy, intTy, intTy, intTy};
-    auto funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), params, false);
+    // ------------------------------
+    // Create module & set triple / datalayout
+    // ------------------------------
+    auto M = std::make_unique<Module>("matmul_module", ctx);
+    Triple triple("nvptx64-nvidia-cuda");
+    M->setTargetTriple(triple);
 
-    auto func = llvm::Function::Create(funcType, llvm::Function::ExternalLinkage, "matmul", module.get());
+    std::string err;
+    const Target *T = TargetRegistry::lookupTarget(triple.getTriple(), err);
+    if (!T) {
+        std::cerr << "Failed to lookup target: " << err << "\n";
+        std::exit(1);
+    }
 
-    auto args = func->args().begin();
-    llvm::Value* leftPtr = args++;
-    llvm::Value* rightPtr = args++;
-    llvm::Value* resultPtr = args++;
-    llvm::Value* rows = args++;
-    llvm::Value* columns = args++;
-    llvm::Value* inners = args++;
+    TargetOptions opt;
+    std::optional<Reloc::Model> relocModel;
+    std::unique_ptr<TargetMachine> TM(
+        T->createTargetMachine(triple,
+                               /*CPU=*/"sm_89", /*Features=*/"",
+                               opt, relocModel));
+    if (!TM) {
+        std::cerr << "Failed to create TargetMachine!\n";
+        std::exit(1);
+    }
+    M->setDataLayout(TM->createDataLayout());
 
-    llvm::IRBuilder<> builder(ctx);
-    llvm::BasicBlock* entry = llvm::BasicBlock::Create(ctx, "entry", func);
-    builder.SetInsertPoint(entry);
+    // ------------------------------
+    // Function signature
+    //   void matmul(float* addrspace(1) A,
+    //               float* addrspace(1) B,
+    //               float* addrspace(1) C,
+    //               int rows, int cols, int inner)
+    // ------------------------------
+    auto &C = ctx;
+    auto f32 = Type::getFloatTy(C);
+    auto i32 = Type::getInt32Ty(C);
+    auto gptrF = PointerType::get(f32, /*addrspace=*/1);
 
-    // Outer loop: for (i = 0; i < rows; ++i)
-    llvm::Value* i = builder.CreateAlloca(intTy, nullptr, "i");
-    builder.CreateStore(llvm::ConstantInt::get(intTy, 0), i);
+    auto *FT = FunctionType::get(Type::getVoidTy(C),
+                                 { gptrF, gptrF, gptrF, i32, i32, i32 },
+                                 false);
+    auto *F = Function::Create(FT, Function::ExternalLinkage, "matmul", M.get());
+    F->setCallingConv(llvm::CallingConv::PTX_Kernel); // <-- THIS IS CRITICAL
+    // Mark as kernel
+    {
+        Metadata *mdVals[] = {
+            ValueAsMetadata::get(F),
+            MDString::get(C, "kernel"),
+            ConstantAsMetadata::get(ConstantInt::get(i32, 1))
+        };
+        auto *mdNode = MDNode::get(C, mdVals);
+        M->getOrInsertNamedMetadata("nvvm.annotations")->addOperand(mdNode);
+    }
 
-    llvm::BasicBlock* loop_i_cond = llvm::BasicBlock::Create(ctx, "loop_i_cond", func);
-    llvm::BasicBlock* loop_i_body = llvm::BasicBlock::Create(ctx, "loop_i_body", func);
-    llvm::BasicBlock* loop_i_end = llvm::BasicBlock::Create(ctx, "loop_i_end", func);
-    builder.CreateBr(loop_i_cond);
+    // ------------------------------
+    // Read arguments
+    // ------------------------------
+    auto args = F->arg_begin();
+    Value *A     = &*args++; A->setName("A");
+    Value *B     = &*args++; B->setName("B");
+    Value *Cout  = &*args++; Cout->setName("C");
+    Value *Rows  = &*args++; Rows->setName("rows");
+    Value *Cols  = &*args++; Cols->setName("cols");
+    Value *Inner = &*args++; Inner->setName("inner");
 
-    builder.SetInsertPoint(loop_i_cond);
-    llvm::Value* i_val = builder.CreateLoad(intTy, i);
-    llvm::Value* i_cond = builder.CreateICmpSLT(i_val, rows);
-    builder.CreateCondBr(i_cond, loop_i_body, loop_i_end);
+    // ------------------------------
+    // Blocks
+    // ------------------------------
+    IRBuilder<> b(C);
+    auto *entry   = BasicBlock::Create(C, "entry", F);
+    auto *oobRet  = BasicBlock::Create(C, "oob.ret", F);
+    auto *kLoop   = BasicBlock::Create(C, "k.loop", F);
+    auto *kBody   = BasicBlock::Create(C, "k.body", F);
+    auto *kEnd    = BasicBlock::Create(C, "k.end", F);
+    auto *retBB   = BasicBlock::Create(C, "ret", F);
 
-    builder.SetInsertPoint(loop_i_body);
+    b.SetInsertPoint(entry);
 
-    // j loop
-    llvm::Value* j = builder.CreateAlloca(intTy, nullptr, "j");
-    builder.CreateStore(llvm::ConstantInt::get(intTy, 0), j);
+    // ------------------------------
+    // Declare NVVM sreg readers
+    // ------------------------------
+    Value *tid_x    = b.CreateCall(getNvvmSReg(*M, "llvm.nvvm.read.ptx.sreg.tid.x"), {});
+    Value *tid_y    = b.CreateCall(getNvvmSReg(*M, "llvm.nvvm.read.ptx.sreg.tid.y"), {});
+    Value *blkDim_x = b.CreateCall(getNvvmSReg(*M, "llvm.nvvm.read.ptx.sreg.ntid.x"),  {});
+    Value *blkDim_y = b.CreateCall(getNvvmSReg(*M, "llvm.nvvm.read.ptx.sreg.ntid.y"),  {});
+    Value *blk_x    = b.CreateCall(getNvvmSReg(*M, "llvm.nvvm.read.ptx.sreg.ctaid.x"), {});
+    Value *blk_y    = b.CreateCall(getNvvmSReg(*M, "llvm.nvvm.read.ptx.sreg.ctaid.y"), {});
 
-    llvm::BasicBlock* loop_j_cond = llvm::BasicBlock::Create(ctx, "loop_j_cond", func);
-    llvm::BasicBlock* loop_j_body = llvm::BasicBlock::Create(ctx, "loop_j_body", func);
-    llvm::BasicBlock* loop_j_end = llvm::BasicBlock::Create(ctx, "loop_j_end", func);
-    builder.CreateBr(loop_j_cond);
+    // row = blockIdx.y * blockDim.y + threadIdx.y
+    // col = blockIdx.x * blockDim.x + threadIdx.x
+    Value *row = b.CreateAdd(b.CreateMul(blk_y, blkDim_y), tid_y, "row");
+    Value *col = b.CreateAdd(b.CreateMul(blk_x, blkDim_x), tid_x, "col");
 
-    builder.SetInsertPoint(loop_j_cond);
-    llvm::Value* j_val = builder.CreateLoad(intTy, j);
-    llvm::Value* j_cond = builder.CreateICmpSLT(j_val, columns);
-    builder.CreateCondBr(j_cond, loop_j_body, loop_j_end);
+    Value *row_ok = b.CreateICmpSLT(row, Rows);
+    Value *col_ok = b.CreateICmpSLT(col, Cols);
+    Value *inBounds = b.CreateAnd(row_ok, col_ok);
+    b.CreateCondBr(inBounds, kLoop, oobRet);
 
-    builder.SetInsertPoint(loop_j_body);
+    // ------------------------------
+    // k-loop (PHI-based, no allocas)
+    // ------------------------------
+    b.SetInsertPoint(kLoop);
+    auto *kPHI   = b.CreatePHI(i32, 2, "k");
+    auto *sumPHI = b.CreatePHI(f32, 2, "sum");
+    kPHI->addIncoming(ConstantInt::get(i32, 0), entry);
+    sumPHI->addIncoming(ConstantFP::get(f32, 0.0f), entry);
 
-    llvm::Value* sum = builder.CreateAlloca(llvm::Type::getFloatTy(ctx), nullptr, "sum");
-    builder.CreateStore(llvm::ConstantFP::get(ctx, llvm::APFloat(0.0f)), sum);
+    Value *kCond = b.CreateICmpSLT(kPHI, Inner);
+    b.CreateCondBr(kCond, kBody, kEnd);
 
-    // k loop
-    llvm::Value* k = builder.CreateAlloca(intTy, nullptr, "k");
-    builder.CreateStore(llvm::ConstantInt::get(intTy, 0), k);
+    // k-body
+    b.SetInsertPoint(kBody);
+    Value *aIdx = b.CreateAdd(b.CreateMul(row, Inner), kPHI);
+    Value *bIdx = b.CreateAdd(b.CreateMul(kPHI, Cols), col);
 
-    llvm::BasicBlock* loop_k_cond = llvm::BasicBlock::Create(ctx, "loop_k_cond", func);
-    llvm::BasicBlock* loop_k_body = llvm::BasicBlock::Create(ctx, "loop_k_body", func);
-    llvm::BasicBlock* loop_k_end = llvm::BasicBlock::Create(ctx, "loop_k_end", func);
-    builder.CreateBr(loop_k_cond);
+    Value *aPtr = b.CreateGEP(f32, A, aIdx);
+    Value *bPtr = b.CreateGEP(f32, B, bIdx);
+    Value *aVal = b.CreateLoad(f32, aPtr);
+    Value *bVal = b.CreateLoad(f32, bPtr);
 
-    builder.SetInsertPoint(loop_k_cond);
-    llvm::Value* k_val = builder.CreateLoad(intTy, k);
-    llvm::Value* k_cond = builder.CreateICmpSLT(k_val, inners);
-    builder.CreateCondBr(k_cond, loop_k_body, loop_k_end);
+    Value *prod    = b.CreateFMul(aVal, bVal);
+    Value *newSum  = b.CreateFAdd(sumPHI, prod);
+    Value *kNext   = b.CreateAdd(kPHI, ConstantInt::get(i32, 1));
 
-    builder.SetInsertPoint(loop_k_body);
-    // Compute left[i * inners + k]
-    llvm::Value* i_inner = builder.CreateMul(i_val, inners);
-    llvm::Value* left_idx = builder.CreateAdd(i_inner, k_val);
-    llvm::Value* left_elem_ptr = builder.CreateGEP(llvm::Type::getFloatTy(ctx), leftPtr, left_idx);
-    llvm::Value* left_val = builder.CreateLoad(llvm::Type::getFloatTy(ctx), left_elem_ptr);
+    kPHI->addIncoming(kNext, kBody);
+    sumPHI->addIncoming(newSum, kBody);
 
-    // Compute right[k * columns + j]
-    llvm::Value* k_col = builder.CreateMul(k_val, columns);
-    llvm::Value* right_idx = builder.CreateAdd(k_col, j_val);
-    llvm::Value* right_elem_ptr = builder.CreateGEP(llvm::Type::getFloatTy(ctx), rightPtr, right_idx);
-    llvm::Value* right_val = builder.CreateLoad(llvm::Type::getFloatTy(ctx), right_elem_ptr);
+    b.CreateBr(kLoop);
 
-    // Multiply and add to sum
-    llvm::Value* prod = builder.CreateFMul(left_val, right_val);
-    llvm::Value* sum_val = builder.CreateLoad(llvm::Type::getFloatTy(ctx), sum);
-    llvm::Value* new_sum = builder.CreateFAdd(sum_val, prod);
-    builder.CreateStore(new_sum, sum);
+    // k-end: store result
+    b.SetInsertPoint(kEnd);
+    Value *cIdx = b.CreateAdd(b.CreateMul(row, Cols), col);
+    Value *cPtr = b.CreateGEP(f32, Cout, cIdx);
+    b.CreateStore(sumPHI, cPtr);
+    b.CreateBr(retBB);
 
-    // k++
-    llvm::Value* k_next = builder.CreateAdd(k_val, llvm::ConstantInt::get(intTy, 1));
-    builder.CreateStore(k_next, k);
-    builder.CreateBr(loop_k_cond);
+    // out-of-bounds threads just return
+    b.SetInsertPoint(oobRet);
+    b.CreateRetVoid();
 
-    builder.SetInsertPoint(loop_k_end);
+    // final return
+    b.SetInsertPoint(retBB);
+    b.CreateRetVoid();
 
-    // result[i * columns + j] = sum
-    llvm::Value* i_col = builder.CreateMul(i_val, columns);
-    llvm::Value* res_idx = builder.CreateAdd(i_col, j_val);
-    llvm::Value* res_ptr = builder.CreateGEP(llvm::Type::getFloatTy(ctx), resultPtr, res_idx);
-    llvm::Value* final_sum = builder.CreateLoad(llvm::Type::getFloatTy(ctx), sum);
-    builder.CreateStore(final_sum, res_ptr);
+    // ------------------------------
+    // Verify
+    // ------------------------------
+    if (verifyFunction(*F, &errs()) || verifyModule(*M, &errs())) {
+        errs() << "<<< Invalid module generated >>>\n";
+        M->print(errs(), nullptr);
+        std::exit(1);
+    }
 
-    // j++
-    llvm::Value* j_next = builder.CreateAdd(j_val, llvm::ConstantInt::get(intTy, 1));
-    builder.CreateStore(j_next, j);
-    builder.CreateBr(loop_j_cond);
-
-    builder.SetInsertPoint(loop_j_end);
-
-    // i++
-    llvm::Value* i_next = builder.CreateAdd(i_val, llvm::ConstantInt::get(intTy, 1));
-    builder.CreateStore(i_next, i);
-    builder.CreateBr(loop_i_cond);
-
-    builder.SetInsertPoint(loop_i_end);
-    builder.CreateRetVoid();
-
-    // Validate IR
-    llvm::verifyFunction(*func);
-    llvm::verifyModule(*module);
-    module->print(llvm::errs(), nullptr);
-    return llvm::orc::ThreadSafeModule(std::move(module), std::move(context));
+    return llvm::orc::ThreadSafeModule(std::move(M), llvm::orc::ThreadSafeContext(TSCtx));
 }
+
+

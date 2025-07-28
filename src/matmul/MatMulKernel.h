@@ -12,7 +12,8 @@ public:
     void initializeMatrices(int rows, int columns, int inners);
     void execute();
     void printResult() const;
-    llvm::orc::ThreadSafeModule createModule();
+    llvm::orc::ThreadSafeModule createModule(llvm::orc::ThreadSafeContext& TSCtx);
+
 
 
 private:
